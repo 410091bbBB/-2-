@@ -1,0 +1,128 @@
+name: 编译 hf-replay
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 方案 F${{ matrix.feed }}-B${{ matrix.bot }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        feed: [1, 2, 3]
+        bot:  [1, 2, 3]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 解包 payload.zip（一包流，没有则跳过）
+        shell: pwsh
+        run: |
+          if (Test-Path payload.zip) {
+            Expand-Archive -Path payload.zip -DestinationPath . -Force
+            Remove-Item payload.zip -Force
+            Write-Host "payload.zip 已解包："
+            Get-ChildItem -Recurse -File | Select-Object -First 30 -ExpandProperty FullName
+          } else {
+            Write-Host "仓库里没有 payload.zip，按正常仓库文件编译"
+          }
+
+      - name: 安装 XMake
+        uses: xmake-io/github-action-setup-xmake@v1
+
+      - name: 缓存 XMake 下载的包
+        uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/.xmake
+          key: xmake-${{ hashFiles('native/xmake.lua') }}
+          restore-keys: xmake-
+
+      - name: 安装 LLVM（clang-cl 工具链要用）
+        uses: ZhongRuoyu/setup-llvm@v0
+        with:
+          llvm-version: 22
+
+      - name: 更新包索引
+        run: xmake repo -u
+
+      - name: 切换方案
+        shell: pwsh
+        run: |
+          $f = '${{ matrix.feed }}'
+          $b = '${{ matrix.bot }}'
+          $p = 'native/src/HfConfig.h'
+          $lines = Get-Content $p
+          $hitF = 0
+          $hitB = 0
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*#define\s+HF_FEED_PLAN\b') { $lines[$i] = "#define HF_FEED_PLAN $f"; $hitF++ }
+            if ($lines[$i] -match '^\s*#define\s+HF_BOT_PLAN\b')  { $lines[$i] = "#define HF_BOT_PLAN $b";  $hitB++ }
+          }
+          if ($hitF -ne 1 -or $hitB -ne 1) {
+            Write-Host "::error::替换失败！HF_FEED_PLAN 命中 $hitF 次，HF_BOT_PLAN 命中 $hitB 次（都应该正好 1 次）"
+            exit 1
+          }
+          Set-Content $p $lines
+          Write-Host "当前方案：HF_FEED_PLAN=$f  HF_BOT_PLAN=$b"
+          Get-Content $p | Select-String -Pattern '^#define HF_(FEED|BOT)_PLAN'
+
+      - name: 编译
+        shell: pwsh
+        run: |
+          cd native
+          xmake f -a x64 -m release -p windows --target_type=server -y
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::锁版本 26.20.* 失败，回退为不锁版本再试"
+            (Get-Content xmake.lua) -replace 'add_requires\("levilamina [^"]*"', 'add_requires("levilamina"' | Set-Content xmake.lua
+            xmake f -a x64 -m release -p windows --target_type=server -y
+          }
+          $out = xmake -v -y 2>&1
+          $out | Out-File -FilePath build.log -Encoding utf8
+          $out | Select-Object -Last 120
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::这一组(F${{matrix.feed}}-B${{matrix.bot}})编不过，往下看 120 行报错"
+            exit 1
+          }
+
+      - name: 打包
+        if: success()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item native/manifest.json dist/
+          $dll = Get-ChildItem -Path native -Recurse -Filter hf-replay.dll | Select-Object -First 1
+          if (-not $dll) {
+            Write-Host "::error::没找到 hf-replay.dll"
+            Get-ChildItem -Path native -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.Extension -in '.dll','.zip','.json' } |
+              Select-Object -ExpandProperty FullName
+            exit 1
+          }
+          Write-Host "dll 在: $($dll.FullName)"
+          Copy-Item $dll.FullName dist/
+          Set-Content -Path dist/这个dll用的方案.txt -Value @"
+          这份 dll 用的是：
+            FeedPlan = ${{ matrix.feed }}   （喂包写法）
+            BotPlan  = ${{ matrix.bot }}   （造假人写法）
+          "@
+          Compress-Archive -Path dist/* -DestinationPath "OK-F${{ matrix.feed }}-B${{ matrix.bot }}.zip"
+
+      - uses: actions/upload-artifact@v7
+        if: success()
+        with:
+          name: OK-F${{ matrix.feed }}-B${{ matrix.bot }}
+          path: OK-F${{ matrix.feed }}-B${{ matrix.bot }}.zip
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: FAIL-F${{ matrix.feed }}-B${{ matrix
